@@ -1,132 +1,127 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-import logging
-import json
-import spacy
+from sqlalchemy.exc import SQLAlchemyError
+from dotenv import load_dotenv
+import os
+
+# Carga de variables de entorno desde un archivo .env (si lo tienes configurado)
+load_dotenv()
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
+# Configuración de la base de datos: Usa DATABASE_URL si está definida en las variables de entorno, sino usa SQLite por defecto
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///site.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Cargar modelo de spaCy
-nlp = spacy.load("es_core_news_sm")
-
-# Modelos de la Base de Datos
+# Definición del modelo Proyecto
 class Proyecto(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     titulo = db.Column(db.String(100), nullable=False)
     descripcion = db.Column(db.Text, nullable=False)
 
-class DocumentoProcesado(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    texto_original = db.Column(db.Text, nullable=False)
-    resumen = db.Column(db.Text, nullable=False)
-    conceptos_clave = db.Column(db.Text, nullable=False)  # JSON string
-    conexiones = db.Column(db.Text, nullable=False)  # JSON string
-    proyecto_id = db.Column(db.Integer, db.ForeignKey('proyecto.id'), nullable=True)
+    def __repr__(self):
+        return f"<Proyecto {self.titulo}>"
 
-    proyecto = db.relationship('Proyecto', backref=db.backref('documentos', lazy=True))
-
-# 📌 Ruta para Procesar un Documento
-@app.route("/procesar_documento", methods=['POST'])
-def procesar_documento():
+# Endpoint para agregar un nuevo proyecto
+@app.route("/agregar_proyecto", methods=['POST'])
+def agregar_proyecto():
     try:
-        datos = request.get_json()
-        if not datos or "texto" not in datos:
-            return jsonify({"error": "Se requiere un texto para procesar"}), 400
-
-        texto = datos["texto"]
-        doc = nlp(texto)
-
-        tokens = [{"texto": token.text, "lema": token.lemma_, "tipo": token.pos_} for token in doc]
-        entidades = [{"texto": entidad.text, "tipo": entidad.label_} for entidad in doc.ents]
-
-        resumen = " ".join([sent.text for sent in doc.sents if any(token.pos_ in ["NOUN", "PROPN"] for token in sent)])
-        conceptos_clave = list(set([token.lemma_ for token in doc if token.pos_ in ["NOUN", "PROPN"]] + [entidad.text for entidad in doc.ents]))
-
-        conexiones = [{"desde": token.text, "hacia": hijo.text, "relacion": hijo.dep_} for token in doc for hijo in token.children if hijo.pos_ in ["NOUN", "PROPN"]]
-
-        respuesta = {
-            "tokens": tokens,
-            "entidades": entidades,
-            "resumen": resumen,
-            "conceptos_clave": conceptos_clave,
-            "conexiones": conexiones
-        }
-        return jsonify(respuesta), 200
-    except Exception as e:
-        logger.exception("Error al procesar el documento: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-# 📌 Ruta para Guardar un Documento Procesado
-@app.route("/guardar_documento", methods=['POST'])
-def guardar_documento():
-    try:
-        datos = request.get_json()
-        if not datos or "texto" not in datos or "resumen" not in datos or "conceptos_clave" not in datos or "conexiones" not in datos:
-            return jsonify({"error": "Faltan datos requeridos"}), 400
-
-        nuevo_documento = DocumentoProcesado(
-            texto_original=datos["texto"],
-            resumen=datos["resumen"],
-            conceptos_clave=json.dumps(datos["conceptos_clave"]),
-            conexiones=json.dumps(datos["conexiones"]),
-            proyecto_id=datos.get("proyecto_id")
-        )
-        db.session.add(nuevo_documento)
+        data = request.get_json()
+        if not data or "titulo" not in data or "descripcion" not in data:
+            return jsonify({"error": "Faltan datos: titulo y descripcion son requeridos"}), 400
+        proyecto = Proyecto(titulo=data['titulo'], descripcion=data['descripcion'])
+        db.session.add(proyecto)
         db.session.commit()
-
-        return jsonify({"mensaje": "Documento procesado guardado correctamente", "documento_id": nuevo_documento.id}), 201
+        return jsonify({
+            "mensaje": "Proyecto agregado correctamente",
+            "id": proyecto.id,
+            "titulo": proyecto.titulo,
+            "descripcion": proyecto.descripcion
+        }), 201
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
     except Exception as e:
-        logger.exception("Error al guardar el documento procesado: %s", e)
         return jsonify({"error": str(e)}), 500
 
-# 📌 Ruta para Listar Documentos con Filtros y Paginación
-@app.route("/listar_documentos", methods=["GET"])
-def listar_documentos():
+# Endpoint para obtener proyectos con paginación
+@app.route("/obtener_proyectos", methods=['GET'])
+def obtener_proyectos():
     try:
-        proyecto_id = request.args.get("proyecto_id")
-        palabra_clave = request.args.get("palabra_clave")
-        pagina = request.args.get("pagina", default=1, type=int)
-        tamano_pagina = request.args.get("tamano_pagina", default=10, type=int)
-
-        consulta = DocumentoProcesado.query
-
-        if proyecto_id:
-            consulta = consulta.filter_by(proyecto_id=proyecto_id)
-        if palabra_clave:
-            consulta = consulta.filter(DocumentoProcesado.texto_original.contains(palabra_clave))
-
-        documentos_paginados = consulta.paginate(page=pagina, per_page=tamano_pagina, error_out=False).items
-
-        lista_documentos = [
-            {
-                "id": doc.id,
-                "texto_original": doc.texto_original,
-                "resumen": doc.resumen,
-                "conceptos_clave": json.loads(doc.conceptos_clave) if doc.conceptos_clave else [],
-                "conexiones": json.loads(doc.conexiones) if doc.conexiones else [],
-                "proyecto_id": doc.proyecto_id
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        pagination = Proyecto.query.paginate(page=page, per_page=per_page, error_out=False)
+        proyectos = []
+        for proyecto in pagination.items:
+            proyecto_data = {
+                'id': proyecto.id,
+                'titulo': proyecto.titulo,
+                'descripcion': proyecto.descripcion
             }
-            for doc in documentos_paginados
-        ]
-
-        return jsonify({
-            "total_documentos": consulta.count(),
-            "pagina_actual": pagina,
-            "tamano_pagina": tamano_pagina,
-            "documentos": lista_documentos
-        }), 200
-
+            proyectos.append(proyecto_data)
+        response = {
+            "total": pagination.total,
+            "page": page,
+            "pages": pagination.pages,
+            "per_page": per_page,
+            "data": proyectos
+        }
+        return jsonify(response)
     except Exception as e:
-        logger.exception("Error al listar documentos procesados: %s", e)
-        return jsonify({"error": "No se pudo obtener la lista de documentos", "detalle": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
+
+# Endpoint para obtener un proyecto por su ID
+@app.route("/obtener_proyecto/<int:id>", methods=['GET'])
+def obtener_proyecto(id):
+    try:
+        proyecto = Proyecto.query.get_or_404(id)
+        proyecto_data = {
+            'id': proyecto.id,
+            'titulo': proyecto.titulo,
+            'descripcion': proyecto.descripcion
+        }
+        return jsonify(proyecto_data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Endpoint para actualizar un proyecto existente
+@app.route("/actualizar_proyecto/<int:id>", methods=['PUT'])
+def actualizar_proyecto(id):
+    try:
+        data = request.get_json()
+        proyecto = Proyecto.query.get_or_404(id)
+        if "titulo" in data:
+            proyecto.titulo = data["titulo"]
+        if "descripcion" in data:
+            proyecto.descripcion = data["descripcion"]
+        db.session.commit()
+        return jsonify({
+            "mensaje": "Proyecto actualizado correctamente",
+            "id": proyecto.id,
+            "titulo": proyecto.titulo,
+            "descripcion": proyecto.descripcion
+        })
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Endpoint para eliminar un proyecto
+@app.route("/eliminar_proyecto/<int:id>", methods=['DELETE'])
+def eliminar_proyecto(id):
+    try:
+        proyecto = Proyecto.query.get_or_404(id)
+        db.session.delete(proyecto)
+        db.session.commit()
+        return jsonify({"mensaje": "Proyecto eliminado correctamente"})
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)
